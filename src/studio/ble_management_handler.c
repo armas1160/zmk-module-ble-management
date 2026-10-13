@@ -16,6 +16,7 @@
 #include <zephyr/bluetooth/addr.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/init.h>
+#include <zephyr/kernel.h>
 #include <zephyr/settings/settings.h>
 #include <zmk/ble.h>
 #include <zmk/ble_management/ble_management.pb.h>
@@ -91,6 +92,48 @@ static int handle_get_output_priority_request(
     const zmk_ble_management_GetOutputPriorityRequest *req,
     zmk_ble_management_Response *resp);
 
+#if IS_ENABLED(CONFIG_ZMK_BLE)
+/**
+ * Names are matched by the 48-bit address only. The settings key holds no
+ * address type, so every name is read back as a public address after a
+ * reboot, and a name saved for a random-address host would never match again.
+ */
+static bool same_addr(const bt_addr_le_t *a, const bt_addr_le_t *b) {
+    return bt_addr_eq(&a->a, &b->a);
+}
+
+static void name_setting_key(const bt_addr_le_t *addr, char *key,
+                             size_t len) {
+    char addr_str[BT_ADDR_STR_LEN];
+    bt_addr_to_str(&addr->a, addr_str, sizeof(addr_str));
+    snprintf(key, len, "ble_mgmt/name/%s", addr_str);
+}
+
+static void delete_saved_name(const bt_addr_le_t *addr) {
+    char key[64];
+    name_setting_key(addr, key, sizeof(key));
+    int err = settings_delete(key);
+    if (err) {
+        LOG_WRN("Failed to delete %s: %d", key, err);
+    }
+}
+
+/**
+ * Whether the host paired to some profile has this address. An open profile
+ * (BT_ADDR_LE_ANY) has no host, so a name saved under that address is stale.
+ */
+static bool is_profile_addr(const bt_addr_le_t *addr) {
+    for (int i = 0; i < ZMK_BLE_PROFILE_COUNT; i++) {
+        bt_addr_le_t *profile_addr = zmk_ble_profile_address(i);
+        if (!bt_addr_le_eq(profile_addr, BT_ADDR_LE_ANY) &&
+            same_addr(profile_addr, addr)) {
+            return true;
+        }
+    }
+    return false;
+}
+#endif
+
 /**
  * Get profile name from cache based on BLE address
  */
@@ -101,7 +144,7 @@ static const char *get_profile_name(const bt_addr_le_t *addr) {
     }
 
     for (int i = 0; i < ZMK_BLE_PROFILE_COUNT; i++) {
-        if (bt_addr_le_eq(&profile_names[i].addr, addr)) {
+        if (same_addr(&profile_names[i].addr, addr)) {
             return profile_names[i].name;
         }
     }
@@ -121,13 +164,26 @@ static int save_profile_name(const bt_addr_le_t *addr, const char *name) {
     // Find existing entry or empty slot
     int slot = -1;
     for (int i = 0; i < ZMK_BLE_PROFILE_COUNT; i++) {
-        if (bt_addr_le_eq(&profile_names[i].addr, addr)) {
+        if (same_addr(&profile_names[i].addr, addr)) {
             slot = i;
             break;
         }
         if (slot == -1 &&
             bt_addr_le_eq(&profile_names[i].addr, BT_ADDR_LE_NONE)) {
             slot = i;
+        }
+    }
+
+    if (slot == -1) {
+        // Every slot is taken. Names of hosts unpaired some other way (e.g.
+        // &bt BT_CLR) stay saved, so reuse the slot of a name whose host is
+        // no longer paired to any profile, and delete that saved name.
+        for (int i = 0; i < ZMK_BLE_PROFILE_COUNT; i++) {
+            if (!is_profile_addr(&profile_names[i].addr)) {
+                delete_saved_name(&profile_names[i].addr);
+                slot = i;
+                break;
+            }
         }
     }
 
@@ -144,15 +200,29 @@ static int save_profile_name(const bt_addr_le_t *addr, const char *name) {
 
     // Save to settings
     char setting_name[64];
-    char addr_str[BT_ADDR_STR_LEN];
-    bt_addr_to_str(&addr->a, addr_str, sizeof(addr_str));
-    snprintf(setting_name, sizeof(setting_name), "ble_mgmt/name/%s", addr_str);
+    name_setting_key(addr, setting_name, sizeof(setting_name));
 
     return settings_save_one(setting_name, name, strlen(name) + 1);
 #else
     return -ENOTSUP;
 #endif
 }
+
+#if IS_ENABLED(CONFIG_ZMK_BLE)
+// A saved name did not fit in the cache while loading.
+static bool name_dropped_on_load;
+
+/**
+ * Address from the part of a name key after "name/". The key holds no address
+ * type, so it reads back as public; same_addr() ignores the type.
+ */
+static int parse_name_addr(const char *next, bt_addr_le_t *addr) {
+    char addr_str[BT_ADDR_STR_LEN];
+    strncpy(addr_str, next, sizeof(addr_str) - 1);
+    addr_str[sizeof(addr_str) - 1] = '\0';
+    return bt_addr_le_from_str(addr_str, "public", addr);
+}
+#endif
 
 /**
  * Settings callback for loading profile names
@@ -164,22 +234,16 @@ static int profile_names_settings_set(const char *name, size_t len,
     int rc;
 
     if (settings_name_steq(name, "name", &next) && next) {
-        char addr_str[BT_ADDR_STR_LEN];
-        strncpy(addr_str, next, sizeof(addr_str) - 1);
-        addr_str[sizeof(addr_str) - 1] = '\0';
-
         bt_addr_le_t addr;
-        // Parse address (format: "XX:XX:XX:XX:XX:XX (type)")
-        if (bt_addr_le_from_str(addr_str, "public", &addr) != 0 &&
-            bt_addr_le_from_str(addr_str, "random", &addr) != 0) {
-            LOG_WRN("Failed to parse address: %s", addr_str);
+        if (parse_name_addr(next, &addr) != 0) {
+            LOG_WRN("Failed to parse address: %s", next);
             return 0;
         }
 
         // Find or allocate slot
         int slot = -1;
         for (int i = 0; i < ZMK_BLE_PROFILE_COUNT; i++) {
-            if (bt_addr_le_eq(&profile_names[i].addr, &addr)) {
+            if (same_addr(&profile_names[i].addr, &addr)) {
                 slot = i;
                 break;
             }
@@ -191,6 +255,7 @@ static int profile_names_settings_set(const char *name, size_t len,
 
         if (slot == -1) {
             LOG_WRN("No slot for loading profile name");
+            name_dropped_on_load = true;
             return 0;
         }
 
@@ -200,7 +265,7 @@ static int profile_names_settings_set(const char *name, size_t len,
         if (rc >= 0) {
             profile_names[slot].name[sizeof(profile_names[slot].name) - 1] =
                 '\0';
-            LOG_DBG("Loaded profile name for %s: %s", addr_str,
+            LOG_DBG("Loaded profile name for %s: %s", next,
                     profile_names[slot].name);
         }
     }
@@ -209,8 +274,82 @@ static int profile_names_settings_set(const char *name, size_t len,
     return 0;
 }
 
+#if IS_ENABLED(CONFIG_ZMK_BLE)
+struct stale_names {
+    bt_addr_le_t addrs[8];
+    size_t count;
+};
+
+/**
+ * Called for every saved name by review_saved_names(). Caches the name of a
+ * paired host if it is not cached yet, and collects the others for deletion.
+ */
+static int review_saved_name(const char *key, size_t len,
+                             settings_read_cb read_cb, void *cb_arg,
+                             void *param) {
+    struct stale_names *stale = param;
+    const char *next;
+    bt_addr_le_t addr;
+
+    if (!settings_name_steq(key, "name", &next) || !next ||
+        parse_name_addr(next, &addr) != 0) {
+        return 0;
+    }
+    if (is_profile_addr(&addr)) {
+        return profile_names_settings_set(key, len, read_cb, cb_arg);
+    }
+    if (stale->count < ARRAY_SIZE(stale->addrs)) {
+        bt_addr_le_copy(&stale->addrs[stale->count++], &addr);
+    }
+    return 0;
+}
+
+/**
+ * Free the slots of hosts that are no longer paired, go through the saved
+ * names again to cache the paired hosts' names, and delete the rest.
+ */
+static void review_saved_names(struct k_work *work) {
+    for (int i = 0; i < ZMK_BLE_PROFILE_COUNT; i++) {
+        if (!is_profile_addr(&profile_names[i].addr)) {
+            bt_addr_le_copy(&profile_names[i].addr, BT_ADDR_LE_NONE);
+            profile_names[i].name[0] = '\0';
+        }
+    }
+
+    // Delete once the storage has been read, not while it is being read
+    struct stale_names stale = {.count = 0};
+    settings_load_subtree_direct("ble_mgmt", review_saved_name, &stale);
+    for (size_t i = 0; i < stale.count; i++) {
+        delete_saved_name(&stale.addrs[i]);
+    }
+}
+
+static K_WORK_DELAYABLE_DEFINE(review_saved_names_work, review_saved_names);
+#endif
+
+/**
+ * Settings commit, run once everything is loaded (the BLE profiles too).
+ * Firmware from before names were deleted on unpair could leave more saved
+ * names than fit in the cache, and which ones load first is up to the
+ * storage, so a paired host may have lost its name. If any name was dropped,
+ * review the saved names. That reads the storage again and writes to it, so
+ * it runs on the system work queue once the load is over, not here on the
+ * thread running settings_load() (the main thread, with a small stack).
+ */
+static int profile_names_settings_commit(void) {
+#if IS_ENABLED(CONFIG_ZMK_BLE)
+    if (name_dropped_on_load) {
+        name_dropped_on_load = false;
+        k_work_schedule(&review_saved_names_work, K_SECONDS(1));
+    }
+#endif
+
+    return 0;
+}
+
 SETTINGS_STATIC_HANDLER_DEFINE(ble_mgmt, "ble_mgmt", NULL,
-                               profile_names_settings_set, NULL, NULL);
+                               profile_names_settings_set,
+                               profile_names_settings_commit, NULL);
 
 /**
  * Main request handler for the custom RPC subsystem.
@@ -354,8 +493,11 @@ static int handle_set_profile_name_request(
         LOG_WRN("Invalid profile index: %d", req->index);
         result.success = false;
     } else {
+        // An open profile (BT_ADDR_LE_ANY) has no host to name. A name saved
+        // under that address would show on every open profile.
         bt_addr_le_t *addr = zmk_ble_profile_address(req->index);
-        if (addr && !bt_addr_le_eq(addr, BT_ADDR_LE_NONE)) {
+        if (addr && !bt_addr_le_eq(addr, BT_ADDR_LE_NONE) &&
+            !bt_addr_le_eq(addr, BT_ADDR_LE_ANY)) {
             int rc         = save_profile_name(addr, req->name);
             result.success = (rc == 0);
         } else {
@@ -417,16 +559,19 @@ static int handle_unpair_profile_request(
         LOG_WRN("Invalid profile index: %d", req->index);
         result.success = false;
     } else {
-        // Clear profile name from cache if it exists
+        // Clear the profile name from the cache and from settings. Left in
+        // settings, it is loaded again on the next boot and keeps a slot.
         bt_addr_le_t *addr = zmk_ble_profile_address(req->index);
-        if (addr && !bt_addr_le_eq(addr, BT_ADDR_LE_NONE)) {
+        if (addr && !bt_addr_le_eq(addr, BT_ADDR_LE_NONE) &&
+            !bt_addr_le_eq(addr, BT_ADDR_LE_ANY)) {
             for (int i = 0; i < ZMK_BLE_PROFILE_COUNT; i++) {
-                if (bt_addr_le_eq(&profile_names[i].addr, addr)) {
+                if (same_addr(&profile_names[i].addr, addr)) {
                     bt_addr_le_copy(&profile_names[i].addr, BT_ADDR_LE_NONE);
                     profile_names[i].name[0] = '\0';
                     break;
                 }
             }
+            delete_saved_name(addr);
         }
         int active = zmk_ble_active_profile_index();
         int rc     = zmk_ble_prof_select(req->index);
